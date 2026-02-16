@@ -4,10 +4,11 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 
-import google.generativeai as genai
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CallbackContext, MessageHandler, filters
 
@@ -18,10 +19,17 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "tenskee_bot")
 
-genai.configure(api_key=GEMINI_API_KEY)
+# Initialize Gemini client (NEW SDK)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # SQLite DB Setup
-DB_FILE = "/app/data/class_data.db"  # Render persistent disk mount path
+if os.getenv("RENDER"):
+    DB_FILE = "/app/data/class_data.db"
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DATA_DIR = os.path.join(BASE_DIR, "data")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    DB_FILE = os.path.join(DATA_DIR, "class_data.db")
 
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
@@ -45,78 +53,98 @@ CREATE TABLE IF NOT EXISTS timetable (
 )
 """
 )
+
 conn.commit()
 
 
-# LLM Parser with Gemini
+# Gemini Parser
 async def parse_message(text: str) -> dict:
-    model = genai.GenerativeModel("gemini-2.5-flash")  # or 'gemini-2.5-flash-lite'
-
     today_str = datetime.now().strftime("%Y-%m-%d")
     prompt = f"""
-    You are Tenskee, a magical class group assistant. Parse the user's message and output ONLY valid JSON:
-    - {{"action": "add_assignment", "task": "string", "due": "YYYY-MM-DD"}}
-    - {{"action": "add_timetable", "day": "Monday", "schedule": "string like 'Math 9AM, Physics 11AM'"}}
-    - {{"action": "list_assignments"}}
-    - {{"action": "unknown"}}
-    
-    Convert relative dates (e.g. "next Friday", "tomorrow") to absolute YYYY-MM-DD. Today is {today_str}.
-    Message: {text}
-    """
+You are Tenskee, a magical class group assistant.
+Output ONLY valid JSON. No explanation. No markdown.
+Allowed formats:
+{{"action": "add_assignment", "task": "string", "due": "YYYY-MM-DD"}}
+{{"action": "add_timetable", "day": "Monday", "schedule": "string"}}
+{{"action": "list_assignments"}}
+{{"action": "unknown"}}
+Convert relative dates properly.
+Today is {today_str}
+Message:
+{text}
+"""
 
-    response = model.generate_content(prompt)
     try:
-        cleaned = (
-            response.text.strip().removeprefix("```json").removesuffix("```").strip()
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=200,
+            ),
         )
-        return json.loads(cleaned)
+
+        if not response or not response.text:
+            raise ValueError("Empty response from Gemini")
+
+        raw = response.text.strip()
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(cleaned)
+        return parsed
+
     except Exception as e:
-        logging.error(f"Parse error: {e}")
-        return {"action": "unknown"}
+        logging.error(f"Gemini failed: {str(e)}")
+        # Return special flag so we know LLM is down
+        return {"action": "llm_down", "error": str(e)}
 
 
-# Handle incoming messages - Trigger on "Tenskee save us" incantation + mention
+# Updated handle_message with fallback
 async def handle_message(update: Update, context: CallbackContext):
     message_text = update.message.text or ""
     lower_text = message_text.lower()
 
-    # Check if bot is mentioned
     mentioned = (
         f"@{BOT_USERNAME.lower()}" in lower_text
-        or f'@{BOT_USERNAME.lower().replace("_bot", "")}' in lower_text
+        or f"@{BOT_USERNAME.lower().replace('_bot','')}" in lower_text
     )
 
-    # Check for the incantation
-    incantation_detected = "tenskee save us" in lower_text
+    if not (mentioned):
+        return
 
-    if not (mentioned and incantation_detected):
-        return  # Silent unless properly summoned
-
-    # Remove the invocation phrase so we can still detect if there's extra command text
+    # Remove invocation phrases
     cleaned_text = message_text
     for phrase in [
         "Tenskee save us",
         "tenskee save us",
         f"@{BOT_USERNAME} save us",
-        f"@{BOT_USERNAME.replace('_bot', '')} save us",
+        f"@{BOT_USERNAME.replace('_bot','')} save us",
         f"@{BOT_USERNAME} Tenskee save us",
-        f"@{BOT_USERNAME.replace('_bot', '')} Tenskee save us",
+        f"@{BOT_USERNAME.replace('_bot','')} Tenskee save us",
     ]:
-        cleaned_text = (
-            cleaned_text.replace(phrase, "", 1)
-            .strip()
-            .replace(phrase.lower(), "", 1)
-            .strip()
-        )
+        cleaned_text = cleaned_text.replace(phrase, "", 1).strip()
+        cleaned_text = cleaned_text.replace(phrase.lower(), "", 1).strip()
 
     cleaned_text = cleaned_text.strip()
 
     reply_prefix = "Tenskee hears your desperate call… ✨ I bring salvation!\n\n"
 
-    # If there's additional text after the incantation → try to parse it as command
+    # Try to parse only if there's extra text after the summon
+    parsed = {"action": "unknown"}
+    llm_failed = False
+
     if cleaned_text:
         parsed = await parse_message(cleaned_text)
+        if parsed.get("action") == "llm_down":
+            llm_failed = True
+            await update.message.reply_text(
+                reply_prefix
+                + "My mystical mind is currently unreachable (quota exhausted or API issue).\n"
+                "But fear not — I can still show you upcoming trials!\n\n"
+            )
+            # Fall through to default reminder block
 
+    # Handle known actions only if LLM succeeded
+    if not llm_failed and cleaned_text:
         if parsed["action"] == "add_assignment":
             cursor.execute(
                 "INSERT INTO assignments (task, due) VALUES (?, ?)",
@@ -154,36 +182,32 @@ async def handle_message(update: Update, context: CallbackContext):
                 await update.message.reply_text(reply_prefix + msg)
             return
 
-        # If parsed something unknown → fall through to default "save us" response
-
-    # Default "save us" behavior: show upcoming stuff
+    # Default: show upcoming stuff (always works, no LLM needed)
     today = datetime.now().date()
     upcoming = []
 
-    # Assignments due in next 7 days
     cursor.execute(
         """
-        SELECT task, due FROM assignments 
+        SELECT task, due FROM assignments
         WHERE due >= ? AND due <= date(?, '+7 days')
         ORDER BY due
-    """,
+        """,
         (today.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")),
     )
     for task, due in cursor.fetchall():
         days_left = (datetime.strptime(due, "%Y-%m-%d").date() - today).days
-        if days_left == 0:
-            upcoming.append(f"**TODAY**: {task}")
-        elif days_left == 1:
-            upcoming.append(f"**Tomorrow**: {task}")
-        else:
-            upcoming.append(f"In {days_left} days: {task}")
+        tag = (
+            "TODAY"
+            if days_left == 0
+            else "Tomorrow" if days_left == 1 else f"In {days_left} days"
+        )
+        upcoming.append(f"{tag}: {task}")
 
-    # Tomorrow's timetable
-    tomorrow = (today + timedelta(days=1)).strftime("%A")
-    cursor.execute("SELECT schedule FROM timetable WHERE day = ?", (tomorrow,))
+    tomorrow_str = (today + timedelta(days=1)).strftime("%A")
+    cursor.execute("SELECT schedule FROM timetable WHERE day = ?", (tomorrow_str,))
     sched = cursor.fetchone()
     if sched:
-        upcoming.append(f"**Tomorrow's classes**: {sched[0]}")
+        upcoming.append(f"Tomorrow's classes: {sched[0]}")
 
     if upcoming:
         response = reply_prefix + "These trials approach:\n" + "\n".join(upcoming)
@@ -193,44 +217,76 @@ async def handle_message(update: Update, context: CallbackContext):
     await update.message.reply_text(response)
 
 
-# Reminder job (daily at 8 AM)
+# Reminder job
 async def send_reminders(context: CallbackContext):
+
     today = datetime.now().date()
+
     tomorrow = today + timedelta(days=1)
 
     cursor.execute(
         "SELECT task, due FROM assignments WHERE due = ? OR due = ?",
-        (today.strftime("%Y-%m-%d"), tomorrow.strftime("%Y-%m-%d")),
+        (
+            today.strftime("%Y-%m-%d"),
+            tomorrow.strftime("%Y-%m-%d"),
+        ),
     )
+
     assignments = cursor.fetchall()
+
     reminders = []
+
     for task, due in assignments:
-        if datetime.strptime(due, "%Y-%m-%d").date() == today:
+
+        if due == today.strftime("%Y-%m-%d"):
+
             reminders.append(f"Due today — brace yourselves: {task}")
+
         else:
+
             reminders.append(f"Due tomorrow: {task}")
 
-    day = today.strftime("%A")
-    cursor.execute("SELECT schedule FROM timetable WHERE day = ?", (day,))
+    cursor.execute(
+        "SELECT schedule FROM timetable WHERE day = ?",
+        (today.strftime("%A"),),
+    )
+
     schedule = cursor.fetchone()
+
     if schedule:
+
         reminders.append(f"Today's path: {schedule[0]}")
 
     if reminders:
+
         await context.bot.send_message(
             GROUP_CHAT_ID,
             "Tenskee awakens with tidings of fate! ✨\n" + "\n".join(reminders),
         )
 
 
-# Main
+# Boot sequence
 logging.basicConfig(level=logging.INFO)
+
 app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_message,
+    )
+)
 
 scheduler = AsyncIOScheduler()
-scheduler.add_job(send_reminders, CronTrigger(hour=8, minute=0), args=[app])
+
+scheduler.add_job(
+    send_reminders,
+    CronTrigger(hour=8, minute=0),
+    args=[app],
+)
+
 scheduler.start()
 
 print("Tenskee is listening...")
+
 app.run_polling()
