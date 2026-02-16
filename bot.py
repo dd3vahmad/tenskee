@@ -15,14 +15,18 @@ from telegram.ext import ApplicationBuilder, CallbackContext, MessageHandler, fi
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+if TOKEN is None:
+    raise ValueError("TELEGRAM_TOKEN is not set")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY is None:
+    raise ValueError("GEMINI_API_KEY is not set")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
+if GROUP_CHAT_ID is None:
+    raise ValueError("GROUP_CHAT_ID is not set")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "tenskee_bot")
 
-# Initialize Gemini client (NEW SDK)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# SQLite DB Setup
 if os.getenv("RENDER"):
     DB_FILE = "/app/data/class_data.db"
 else:
@@ -57,7 +61,6 @@ CREATE TABLE IF NOT EXISTS timetable (
 conn.commit()
 
 
-# Gemini Parser
 async def parse_message(text: str) -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
     prompt = f"""
@@ -94,12 +97,10 @@ Message:
 
     except Exception as e:
         logging.error(f"Gemini failed: {str(e)}")
-        # Return special flag so we know LLM is down
         return {"action": "llm_down", "error": str(e)}
 
 
-# Updated handle_message with fallback
-async def handle_message(update: Update, context: CallbackContext):
+async def handle_message(update: Update, _: CallbackContext):
     message_text = update.message.text or ""
     lower_text = message_text.lower()
 
