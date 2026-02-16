@@ -124,38 +124,38 @@ async def start(update: Update, _: CallbackContext):
     user = update.effective_user
     is_group = update.effective_chat.type in ["group", "supergroup"]
 
-    welcome = f"Hello {user.first_name}! ✨ I'm **Tenskee**, your magical class group assistant.\n\n"
+    welcome = f"Hello {user.first_name}! ✨ I'm <b>Tenskee</b>, your magical class group assistant.\n\n"
 
     if is_group:
         welcome += (
             "I'm already here — perfect!\n\n"
-            "Summon me with: **@tenskee_bot save us**\n\n"
-            "Examples:\n"
-            "• @tenskee_bot upcoming assignments + events + tomorrow timetable\n"
-            "• @tenskee_bot add math quiz due next Friday\n"
-            "• @tenskee_bot add exam Data Structures March 10\n"
-            "• @tenskee_bot add timetable Monday OOP 9AM, Stats 11AM\n"
-            "• @tenskee_bot list assignments\n"
-            "• @tenskee_bot list events\n\n"
+            "Summon me with: <code>@tenskee_bot save us</code>\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>@tenskee_bot </code> → upcoming assignments + events + tomorrow timetable\n"
+            "• <code>@tenskee_bot add math quiz due next Friday</code>\n"
+            "• <code>@tenskee_bot add exam Data Structures March 10</code>\n"
+            "• <code>@tenskee_bot add timetable Monday OOP 9AM, Stats 11AM</code>\n"
+            "• <code>@tenskee_bot list assignments</code>\n"
+            "• <code>@tenskee_bot list events</code>\n\n"
             "Daily reminders at 6:00 AM with today's due items, events, and timetable.\n\n"
             "Let the magic begin! 🪄"
         )
     else:
         welcome += (
-            "I'm built for **Telegram group chats** (class/department groups).\n\n"
-            "1. Add me to your group:\n"
+            "I'm built for <b>Telegram group chats</b> (class/department groups).\n\n"
+            "<b>1. Add me to your group:</b>\n"
             "   Open group → tap name → Add Members → search @tenskee_bot → Add\n\n"
-            "2. Summon with:\n"
-            "   **@tenskee_bot save us**\n\n"
-            "Examples:\n"
-            "   • @tenskee_bot add physics midterm due 2026-03-15\n"
-            "   • @tenskee_bot add event Group meeting next Tuesday 4PM notes Bring laptop\n"
-            "   • @tenskee_bot list events\n\n"
+            "<b>2. Summon with:</b>\n"
+            "   <code>@tenskee_bot save us</code>\n\n"
+            "<b>Examples:</b>\n"
+            "   • <code>@tenskee_bot add physics midterm due 2026-03-15</code>\n"
+            "   • <code>@tenskee_bot add event Group meeting next Tuesday 4PM notes Bring laptop</code>\n"
+            "   • <code>@tenskee_bot list events</code>\n\n"
             "I send automatic daily reminders at 6:00 AM.\n\n"
             "Go add me to your group — I'll save your semester! ✨"
         )
 
-    await update.message.reply_text(welcome, parse_mode="Markdown")
+    await update.message.reply_text(welcome, parse_mode="HTML")
 
 
 async def handle_message(update: Update, _: CallbackContext):
