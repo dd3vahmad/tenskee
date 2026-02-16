@@ -2,10 +2,10 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
+from datetime import time as dt_time
+from datetime import timedelta
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -17,38 +17,31 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 if TOKEN is None:
     raise ValueError("TELEGRAM_TOKEN is not set")
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY is None:
     raise ValueError("GEMINI_API_KEY is not set")
+
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 if GROUP_CHAT_ID is None:
     raise ValueError("GROUP_CHAT_ID is not set")
+
 BOT_USERNAME = os.getenv("BOT_USERNAME", "tenskee_bot")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Database setup
 if os.getenv("RENDER"):
-    try:
-        DATA_DIR = "/app/data"
-        os.makedirs(DATA_DIR, exist_ok=True)
-        DB_FILE = os.path.join(DATA_DIR, "class_data.db")
-
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        print(f"Using persistent DB at {DB_FILE}")
-
-    except Exception as e:
-        print(f"Persistent disk unavailable ({e}), using in-memory DB")
-        conn = sqlite3.connect(":memory:", check_same_thread=False)
-
+    DB_FILE = "/app/data/class_data.db"
+    print(f"[DB] Using Render persistent path: {DB_FILE}")
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(BASE_DIR, "data")
     os.makedirs(DATA_DIR, exist_ok=True)
-
     DB_FILE = os.path.join(DATA_DIR, "class_data.db")
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    print(f"Using local DB at {DB_FILE}")
+    print(f"[DB] Using local path: {DB_FILE}")
 
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute(
@@ -70,10 +63,10 @@ CREATE TABLE IF NOT EXISTS timetable (
 )
 """
 )
-
 conn.commit()
 
 
+# Gemini Parser
 async def parse_message(text: str) -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
     prompt = f"""
@@ -89,7 +82,6 @@ Today is {today_str}
 Message:
 {text}
 """
-
     try:
         response = client.models.generate_content(
             model="gemini-2.0-flash",
@@ -99,20 +91,18 @@ Message:
                 max_output_tokens=200,
             ),
         )
-
         if not response or not response.text:
             raise ValueError("Empty response from Gemini")
-
         raw = response.text.strip()
         cleaned = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(cleaned)
         return parsed
-
     except Exception as e:
         logging.error(f"Gemini failed: {str(e)}")
         return {"action": "llm_down", "error": str(e)}
 
 
+# Message handler
 async def handle_message(update: Update, _: CallbackContext):
     message_text = update.message.text or ""
     lower_text = message_text.lower()
@@ -122,7 +112,7 @@ async def handle_message(update: Update, _: CallbackContext):
         or f"@{BOT_USERNAME.lower().replace('_bot','')}" in lower_text
     )
 
-    if not (mentioned):
+    if not mentioned:
         return
 
     # Remove invocation phrases
@@ -142,7 +132,6 @@ async def handle_message(update: Update, _: CallbackContext):
 
     reply_prefix = "Tenskee hears your desperate call… ✨ I bring salvation!\n\n"
 
-    # Try to parse only if there's extra text after the summon
     parsed = {"action": "unknown"}
     llm_failed = False
 
@@ -155,9 +144,7 @@ async def handle_message(update: Update, _: CallbackContext):
                 + "My mystical mind is currently unreachable (quota exhausted or API issue).\n"
                 "But fear not — I can still show you upcoming trials!\n\n"
             )
-            # Fall through to default reminder block
 
-    # Handle known actions only if LLM succeeded
     if not llm_failed and cleaned_text:
         if parsed["action"] == "add_assignment":
             cursor.execute(
@@ -170,7 +157,6 @@ async def handle_message(update: Update, _: CallbackContext):
                 + f"Assignment sealed: {parsed['task']} due {parsed['due']}"
             )
             return
-
         elif parsed["action"] == "add_timetable":
             cursor.execute(
                 "INSERT OR REPLACE INTO timetable (day, schedule) VALUES (?, ?)",
@@ -181,7 +167,6 @@ async def handle_message(update: Update, _: CallbackContext):
                 reply_prefix + f"Timetable inscribed for {parsed['day']}"
             )
             return
-
         elif parsed["action"] == "list_assignments":
             cursor.execute("SELECT task, due FROM assignments ORDER BY due")
             assignments = cursor.fetchall()
@@ -196,10 +181,9 @@ async def handle_message(update: Update, _: CallbackContext):
                 await update.message.reply_text(reply_prefix + msg)
             return
 
-    # Default: show upcoming stuff (always works, no LLM needed)
+    # Default fallback: upcoming info
     today = datetime.now().date()
     upcoming = []
-
     cursor.execute(
         """
         SELECT task, due FROM assignments
@@ -231,76 +215,51 @@ async def handle_message(update: Update, _: CallbackContext):
     await update.message.reply_text(response)
 
 
-# Reminder job
-async def send_reminders(context: CallbackContext):
-
+# Daily reminder job (using JobQueue)
+async def send_reminders_job(context: CallbackContext):
     today = datetime.now().date()
-
-    tomorrow = today + timedelta(days=1)
+    reminders = []
 
     cursor.execute(
         "SELECT task, due FROM assignments WHERE due = ? OR due = ?",
-        (
-            today.strftime("%Y-%m-%d"),
-            tomorrow.strftime("%Y-%m-%d"),
-        ),
+        (today.strftime("%Y-%m-%d"), (today + timedelta(days=1)).strftime("%Y-%m-%d")),
     )
-
     assignments = cursor.fetchall()
-
-    reminders = []
-
     for task, due in assignments:
-
         if due == today.strftime("%Y-%m-%d"):
-
             reminders.append(f"Due today — brace yourselves: {task}")
-
         else:
-
             reminders.append(f"Due tomorrow: {task}")
 
     cursor.execute(
-        "SELECT schedule FROM timetable WHERE day = ?",
-        (today.strftime("%A"),),
+        "SELECT schedule FROM timetable WHERE day = ?", (today.strftime("%A"),)
     )
-
     schedule = cursor.fetchone()
-
     if schedule:
-
         reminders.append(f"Today's path: {schedule[0]}")
 
     if reminders:
+        try:
+            await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                text="Tenskee awakens with tidings of fate! ✨\n"
+                + "\n".join(reminders),
+            )
+        except Exception as e:
+            logging.error(f"Failed to send daily reminder: {e}")
 
-        await context.bot.send_message(
-            GROUP_CHAT_ID,
-            "Tenskee awakens with tidings of fate! ✨\n" + "\n".join(reminders),
-        )
 
-
-# Boot sequence
+# Main
 logging.basicConfig(level=logging.INFO)
 
 app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_message,
-    )
+# Schedule daily reminder at 6:00 AM
+app.job_queue.run_daily(
+    send_reminders_job,
+    time=dt_time(6, 0),
 )
-
-scheduler = AsyncIOScheduler()
-
-scheduler.add_job(
-    send_reminders,
-    CronTrigger(hour=8, minute=0),
-    args=[app],
-)
-
-scheduler.start()
 
 print("Tenskee is listening...")
-
 app.run_polling()
