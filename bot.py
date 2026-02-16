@@ -10,7 +10,13 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CallbackContext, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackContext,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 load_dotenv()
 
@@ -31,27 +37,16 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "tenskee_bot")
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 if os.getenv("RENDER"):
-    try:
-        DATA_DIR = "/app/data"
-        os.makedirs(DATA_DIR, exist_ok=True)
-        DB_FILE = os.path.join(DATA_DIR, "class_data.db")
-
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        print(f"Using persistent DB at {DB_FILE}")
-
-    except Exception as e:
-        print(f"Persistent disk unavailable ({e}), using in-memory DB")
-        conn = sqlite3.connect(":memory:", check_same_thread=False)
-
+    DB_FILE = "/app/data/class_data.db"
+    print(f"[DB] Using Render persistent path: {DB_FILE}")
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(BASE_DIR, "data")
     os.makedirs(DATA_DIR, exist_ok=True)
-
     DB_FILE = os.path.join(DATA_DIR, "class_data.db")
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    print(f"Using local DB at {DB_FILE}")
+    print(f"[DB] Using local path: {DB_FILE}")
 
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute(
@@ -73,21 +68,34 @@ CREATE TABLE IF NOT EXISTS timetable (
 )
 """
 )
+
+cursor.execute(
+    """
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT,                    -- exam, test, quiz, presentation, meeting, etc.
+    title TEXT NOT NULL,
+    date DATE NOT NULL,
+    notes TEXT
+)
+"""
+)
 conn.commit()
 
 
-# Gemini Parser
 async def parse_message(text: str) -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
     prompt = f"""
-You are Tenskee, a magical class group assistant.
+You are Tenskee, a magical class group assistant for students.
 Output ONLY valid JSON. No explanation. No markdown.
 Allowed formats:
 {{"action": "add_assignment", "task": "string", "due": "YYYY-MM-DD"}}
 {{"action": "add_timetable", "day": "Monday", "schedule": "string"}}
 {{"action": "list_assignments"}}
+{{"action": "add_event", "type": "exam/test/quiz/presentation/etc or empty", "title": "string", "date": "YYYY-MM-DD", "notes": "string or empty"}}
+{{"action": "list_events"}}
 {{"action": "unknown"}}
-Convert relative dates properly.
+Convert relative dates properly (tomorrow, next Friday, in 2 weeks → absolute YYYY-MM-DD).
 Today is {today_str}
 Message:
 {text}
@@ -98,7 +106,7 @@ Message:
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.1,
-                max_output_tokens=200,
+                max_output_tokens=300,
             ),
         )
         if not response or not response.text:
@@ -112,7 +120,44 @@ Message:
         return {"action": "llm_down", "error": str(e)}
 
 
-# Message handler
+async def start(update: Update, _: CallbackContext):
+    user = update.effective_user
+    is_group = update.effective_chat.type in ["group", "supergroup"]
+
+    welcome = f"Hello {user.first_name}! ✨ I'm **Tenskee**, your magical class group assistant.\n\n"
+
+    if is_group:
+        welcome += (
+            "I'm already here — perfect!\n\n"
+            "Summon me with: **@tenskee_bot save us**\n\n"
+            "Examples:\n"
+            "• @tenskee_bot upcoming assignments + events + tomorrow timetable\n"
+            "• @tenskee_bot add math quiz due next Friday\n"
+            "• @tenskee_bot add exam Data Structures March 10\n"
+            "• @tenskee_bot add timetable Monday OOP 9AM, Stats 11AM\n"
+            "• @tenskee_bot list assignments\n"
+            "• @tenskee_bot list events\n\n"
+            "Daily reminders at 6:00 AM with today's due items, events, and timetable.\n\n"
+            "Let the magic begin! 🪄"
+        )
+    else:
+        welcome += (
+            "I'm built for **Telegram group chats** (class/department groups).\n\n"
+            "1. Add me to your group:\n"
+            "   Open group → tap name → Add Members → search @tenskee_bot → Add\n\n"
+            "2. Summon with:\n"
+            "   **@tenskee_bot save us**\n\n"
+            "Examples:\n"
+            "   • @tenskee_bot add physics midterm due 2026-03-15\n"
+            "   • @tenskee_bot add event Group meeting next Tuesday 4PM notes Bring laptop\n"
+            "   • @tenskee_bot list events\n\n"
+            "I send automatic daily reminders at 6:00 AM.\n\n"
+            "Go add me to your group — I'll save your semester! ✨"
+        )
+
+    await update.message.reply_text(welcome, parse_mode="Markdown")
+
+
 async def handle_message(update: Update, _: CallbackContext):
     message_text = update.message.text or ""
     lower_text = message_text.lower()
@@ -125,7 +170,6 @@ async def handle_message(update: Update, _: CallbackContext):
     if not mentioned:
         return
 
-    # Remove invocation phrases
     cleaned_text = message_text
     for phrase in [
         "Tenskee save us",
@@ -167,6 +211,7 @@ async def handle_message(update: Update, _: CallbackContext):
                 + f"Assignment sealed: {parsed['task']} due {parsed['due']}"
             )
             return
+
         elif parsed["action"] == "add_timetable":
             cursor.execute(
                 "INSERT OR REPLACE INTO timetable (day, schedule) VALUES (?, ?)",
@@ -177,29 +222,70 @@ async def handle_message(update: Update, _: CallbackContext):
                 reply_prefix + f"Timetable inscribed for {parsed['day']}"
             )
             return
+
         elif parsed["action"] == "list_assignments":
             cursor.execute("SELECT task, due FROM assignments ORDER BY due")
             assignments = cursor.fetchall()
             if not assignments:
                 await update.message.reply_text(
-                    reply_prefix + "No mortal burdens recorded yet."
+                    reply_prefix + "No assignments recorded yet."
                 )
             else:
-                msg = "Current burdens:\n" + "\n".join(
+                msg = "Assignments:\n" + "\n".join(
                     f"- {task} (due {due})" for task, due in assignments
                 )
                 await update.message.reply_text(reply_prefix + msg)
             return
 
-    # Default fallback: upcoming info
+        elif parsed["action"] == "add_event":
+            cursor.execute(
+                "INSERT INTO events (type, title, date, notes) VALUES (?, ?, ?, ?)",
+                (
+                    parsed.get("type") or None,
+                    parsed["title"],
+                    parsed["date"],
+                    parsed.get("notes") or None,
+                ),
+            )
+            conn.commit()
+            type_str = f" ({parsed['type']})" if parsed.get("type") else ""
+            notes_str = f" – {parsed['notes']}" if parsed.get("notes") else ""
+            await update.message.reply_text(
+                reply_prefix
+                + f"Event{type_str} added: {parsed['title']} on {parsed['date']}{notes_str}"
+            )
+            return
+
+        elif parsed["action"] == "list_events":
+            today = datetime.now().date()
+            cursor.execute(
+                """
+                SELECT type, title, date, notes FROM events
+                WHERE date >= ?
+                ORDER BY date
+                LIMIT 10
+                """,
+                (today.strftime("%Y-%m-%d"),),
+            )
+            events = cursor.fetchall()
+            if not events:
+                await update.message.reply_text(
+                    reply_prefix + "No upcoming events recorded."
+                )
+            else:
+                msg = "Upcoming events:\n"
+                for typ, title, date, notes in events:
+                    type_str = f"[{typ}] " if typ else ""
+                    notes_str = f" – {notes}" if notes else ""
+                    msg += f"- {type_str}{title} ({date}){notes_str}\n"
+                await update.message.reply_text(reply_prefix + msg)
+            return
+
     today = datetime.now().date()
     upcoming = []
+
     cursor.execute(
-        """
-        SELECT task, due FROM assignments
-        WHERE due >= ? AND due <= date(?, '+7 days')
-        ORDER BY due
-        """,
+        "SELECT task, due FROM assignments WHERE due >= ? AND due <= date(?, '+7 days') ORDER BY due",
         (today.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")),
     )
     for task, due in cursor.fetchall():
@@ -209,7 +295,22 @@ async def handle_message(update: Update, _: CallbackContext):
             if days_left == 0
             else "Tomorrow" if days_left == 1 else f"In {days_left} days"
         )
-        upcoming.append(f"{tag}: {task}")
+        upcoming.append(f"Assignment {tag}: {task}")
+
+    cursor.execute(
+        "SELECT type, title, date, notes FROM events WHERE date >= ? AND date <= date(?, '+14 days') ORDER BY date",
+        (today.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")),
+    )
+    for typ, title, date, notes in cursor.fetchall():
+        days_left = (datetime.strptime(date, "%Y-%m-%d").date() - today).days
+        tag = (
+            "TODAY"
+            if days_left == 0
+            else "Tomorrow" if days_left == 1 else f"In {days_left} days"
+        )
+        type_str = f"[{typ.upper()}] " if typ else ""
+        notes_str = f" – {notes}" if notes else ""
+        upcoming.append(f"Event {type_str}{tag}: {title}{notes_str}")
 
     tomorrow_str = (today + timedelta(days=1)).strftime("%A")
     cursor.execute("SELECT schedule FROM timetable WHERE day = ?", (tomorrow_str,))
@@ -225,21 +326,30 @@ async def handle_message(update: Update, _: CallbackContext):
     await update.message.reply_text(response)
 
 
-# Daily reminder job (using JobQueue)
 async def send_reminders_job(context: CallbackContext):
     today = datetime.now().date()
     reminders = []
 
     cursor.execute(
-        "SELECT task, due FROM assignments WHERE due = ? OR due = ?",
-        (today.strftime("%Y-%m-%d"), (today + timedelta(days=1)).strftime("%Y-%m-%d")),
+        "SELECT task FROM assignments WHERE due = ?",
+        (today.strftime("%Y-%m-%d"),),
     )
-    assignments = cursor.fetchall()
-    for task, due in assignments:
-        if due == today.strftime("%Y-%m-%d"):
-            reminders.append(f"Due today — brace yourselves: {task}")
-        else:
-            reminders.append(f"Due tomorrow: {task}")
+    for (task,) in cursor.fetchall():
+        reminders.append(f"Due today — brace yourselves: {task}")
+
+    tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    cursor.execute("SELECT task FROM assignments WHERE due = ?", (tomorrow_str,))
+    for (task,) in cursor.fetchall():
+        reminders.append(f"Due tomorrow: {task}")
+
+    cursor.execute(
+        "SELECT type, title, notes FROM events WHERE date = ?",
+        (today.strftime("%Y-%m-%d"),),
+    )
+    for typ, title, notes in cursor.fetchall():
+        type_str = f"[{typ.upper()}] " if typ else ""
+        notes_str = f" – {notes}" if notes else ""
+        reminders.append(f"Today: {type_str}{title}{notes_str}")
 
     cursor.execute(
         "SELECT schedule FROM timetable WHERE day = ?", (today.strftime("%A"),)
@@ -263,9 +373,14 @@ async def send_reminders_job(context: CallbackContext):
 logging.basicConfig(level=logging.INFO)
 
 app = ApplicationBuilder().token(TOKEN).build()
+
+# /start command
+app.add_handler(CommandHandler("start", start))
+
+# Main message handler
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# Schedule daily reminder at 6:00 AM
+# Daily at 6:00 AM
 app.job_queue.run_daily(
     send_reminders_job,
     time=dt_time(6, 0),
