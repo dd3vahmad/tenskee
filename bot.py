@@ -30,18 +30,28 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "tenskee_bot")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Database setup
 if os.getenv("RENDER"):
-    DB_FILE = "/app/data/class_data.db"
-    print(f"[DB] Using Render persistent path: {DB_FILE}")
+    try:
+        DATA_DIR = "/app/data"
+        os.makedirs(DATA_DIR, exist_ok=True)
+        DB_FILE = os.path.join(DATA_DIR, "class_data.db")
+
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        print(f"Using persistent DB at {DB_FILE}")
+
+    except Exception as e:
+        print(f"Persistent disk unavailable ({e}), using in-memory DB")
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(BASE_DIR, "data")
     os.makedirs(DATA_DIR, exist_ok=True)
-    DB_FILE = os.path.join(DATA_DIR, "class_data.db")
-    print(f"[DB] Using local path: {DB_FILE}")
 
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    DB_FILE = os.path.join(DATA_DIR, "class_data.db")
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    print(f"Using local DB at {DB_FILE}")
+
 cursor = conn.cursor()
 
 cursor.execute(
